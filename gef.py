@@ -49313,6 +49313,8 @@ class KernelTaskCommand(GenericCommand):
                         help="print file descriptors for each user process.")
     parser.add_argument("-s", "--print-sighand", action="store_true",
                         help="print signals for each user process.")
+    parser.add_argument("-N", "--print-namespace", action="store_true",
+                        help="print namespaces for each user process.")
     parser.add_argument("-u", "--user-process-only", action="store_true",
                         help="display user-land process (+ thread) only.")
     parser.add_argument("--meta", action="store_true", help="display offset information.")
@@ -49345,21 +49347,27 @@ class KernelTaskCommand(GenericCommand):
     _note_ += "    | ...          |   |   ma_root    |-----+    |   slot[]          |--+  |\n"
     _note_ += "    | stack_canary |   | ...          |          +-------------------+     |\n"
     _note_ += "    | ...          |   +--------------+                                    |\n"
-    _note_ += "    | group_leader |         +-->+-cred---------+             +------------+\n"
-    _note_ += "    | ...          |         |   | ...          |             |\n"
-    _note_ += "    | thread_group |-->...   |   | uid, gid     |             |\n"
-    _note_ += "    | ...          |         |   | suid, sgid   |             |\n"
-    _note_ += "    | cred         |---------+   | euid, egid   |             |\n"
-    _note_ += "    | ...          |             | fsuid, fsgid |             |                        +-mount----------+\n"
-    _note_ += "    | comm[16]     |             | securebits   |             |                        | ...            |\n"
-    _note_ += "    | ...          |             | ...          |             |                        | mnt_parent     |-->mount\n"
-    _note_ += "    | files        |--+          +--------------+             |                        | mnt_mountpoint |-->dentry\n"
-    _note_ += "    | ...          |  |                                       |                  +---->| mnt (vfsmount) |\n"
-    _note_ += "    | sighand      |------->+-sighand_struct----+             |                  |     |   mnt_root     |-->dentry\n"
-    _note_ += "    | ...          |  |     | ...               |             |                  |     |   ...          |\n"
-    _note_ += "    +--------------+  |     | action[64]        |             |                  |     | ...            |\n"
-    _note_ += "                      |     +-------------------+             |                  |     +----------------+\n"
-    _note_ += "+---------------------+                                       |                  |\n"
+    _note_ += "    | group_leader |                                                       |\n"
+    _note_ += "    | ...          |         +-->+-cred---------+             +------------+\n"
+    _note_ += "    | thread_group |-->...   |   | ...          |             |\n"
+    _note_ += "    | ...          |         |   | uid, gid     |             |\n"
+    _note_ += "    | cred         |---------+   | suid, sgid   |             |\n"
+    _note_ += "    | ...          |             | euid, egid   |             |\n"
+    _note_ += "    | comm[16]     |             | fsuid, fsgid |             |\n"
+    _note_ += "    | ...          |             | ...          |             |\n"
+    _note_ += "    | files        |--+          +--------------+             |\n"
+    _note_ += "    | ...          |  |                                       |\n"
+    _note_ += "    | nsproxy      |------->+-nsproxy----------------+        |\n"
+    _note_ += "    | ...          |  |     | count                  |        |                        +-mount----------+\n"
+    _note_ += "    | sighand      |-----+  | uts_ns, ipc_ns, mnt_ns |        |                        | ...            |\n"
+    _note_ += "    | ...          |  |  |  | pid_ns_for_children    |        |                        | mnt_parent     |-->mount\n"
+    _note_ += "    +--------------+  |  |  | net_ns, time_ns, ...   |        |                        | mnt_mountpoint |-->dentry\n"
+    _note_ += "                      |  |  +------------------------+        |                  +---->| mnt (vfsmount) |\n"
+    _note_ += "                      |  |                                    |                  |     |   mnt_root     |-->dentry\n"
+    _note_ += "                      |  +->+-sighand_struct----+             |                  |     |   ...          |\n"
+    _note_ += "                      |     | ...               |             |                  |     | ...            |\n"
+    _note_ += "                      |     | action[64]        |             |                  |     +----------------+\n"
+    _note_ += "+---------------------+     +-------------------+             |                  |\n"
     _note_ += "|                                                             v                  | +-->+-dentry-----+\n"
     _note_ += "+-->+-files_struct-+  +-->+-fdtable---+  +-->+-file*[]-----+  +-->+-file------+  | |   | ...        |\n"
     _note_ += "    | ...          |  |   | max_fds   |  |   | [0]         |--+   | ...       |  | |   | d_parent   |\n"
@@ -49388,12 +49396,14 @@ class KernelTaskCommand(GenericCommand):
         self.offset_cred = None
         self.offset_files = None
         self.offset_sighand = None
+        self.offset_nsproxy = None
         # files_struct
         self.offset_fdt = None
         # kstack
         self.offset_ptregs = None
         # cred
         self.offset_uid = None
+        self.offset_user_ns = None
         # vm_area_struct
         self.offset_vm_mm = None
         self.offset_vm_flags = None
@@ -49965,6 +49975,68 @@ class KernelTaskCommand(GenericCommand):
         else:
             offset_uid += 4 + current_arch.ptrsize + 4
         return offset_uid
+
+    def get_offset_user_ns(self, init_task_cred_ptr, offset_uid):
+        """
+        struct cred {
+            ...
+            kernel_cap_t cap_ambient;
+        #ifdef CONFIG_KEYS
+            unsigned char jit_keyring;
+            struct key *session_keyring;
+            struct key *process_keyring;
+            struct key *thread_keyring;
+            struct key *request_key_auth;
+        #endif
+        #ifdef CONFIG_SECURITY
+            void *security;
+        #endif
+            struct user_struct *user;
+            struct user_namespace *user_ns;
+            ...
+        }
+
+        [Example x64; CONFIG_KEYS=y, CONFIG_SECIRYT=y]
+        0xffff9ec6c88379c0|+0x0000|+000: 0x000000000000000a
+        0xffff9ec6c88379c8|+0x0008|+001: 0x0000000000000000
+        0xffff9ec6c88379d0|+0x0010|+002: 0x0000000000000000
+        0xffff9ec6c88379d8|+0x0018|+003: 0x0000000000000000
+        0xffff9ec6c88379e0|+0x0020|+004: 0x0000000000000000
+        0xffff9ec6c88379e8|+0x0028|+005: 0x0000000000000000
+        0xffff9ec6c88379f0|+0x0030|+006: 0x000001ffffffffff
+        0xffff9ec6c88379f8|+0x0038|+007: 0x000001ffffffffff
+        0xffff9ec6c8837a00|+0x0040|+008: 0x000001ffffffffff
+        0xffff9ec6c8837a08|+0x0048|+009: 0x0000000000000000  // cap_ambient
+        0xffff9ec6c8837a10|+0x0050|+010: 0x0000000000000000  // jit_keyring
+        0xffff9ec6c8837a18|+0x0058|+011: 0xffff9ec6c4643700  ->  0x182031ce00000006 // session_keyring
+        0xffff9ec6c8837a20|+0x0060|+012: 0x0000000000000000  // process_keyring
+        0xffff9ec6c8837a28|+0x0068|+013: 0x0000000000000000  // thread_keyring
+        0xffff9ec6c8837a30|+0x0070|+014: 0x0000000000000000  // request_key_auth
+        0xffff9ec6c8837a38|+0x0078|+015: 0xffff9ec6c8873fe0  ->  0xffff9ec6c1052eb0  ->  0x00000000000002e8 // security
+        0xffff9ec6c8837a40|+0x0080|+016: 0xffffffffbb64c5c0  ->  0x0000004f00000084 // user
+        0xffff9ec6c8837a48|+0x0088|+017: 0xffff9ec6c820eaa0  ->  0x0000000000000001 // user_ns
+        """
+        uid_gid_size = 4 * 8 # uid_t:4byte. len([uid,gid,suid,sgid,euid,egid,fsuid,fsgid]) == 8
+        sizeof_securebits = 4
+        cap_size = 8 * 5 # cap_t:8byte. len([cap_inheritable,cap_permitted,cap_effective,cap_bset,cap_ambient]) == 5
+        pos = init_task_cred_ptr + offset_uid + uid_gid_size + sizeof_securebits + cap_size
+
+        x = read_int_from_memory(pos)
+        if not is_valid_addr(x):
+            # CONFIG_KEYS=y
+            pos += current_arch.ptrsize * 5
+
+        x = read_int_from_memory(pos)
+        if not is_valid_addr(x):
+            return None
+        y = read_int_from_memory(x)
+        if is_valid_addr(y) or y == 0:
+            # CONFIG_SECURITY=y
+            pos += current_arch.ptrsize
+
+        # here, pos points user.
+        user_ns = pos + current_arch.ptrsize
+        return user_ns - init_task_cred_ptr
 
     class MapleTree:
         """Linux v6.1 introduces maple_tree. This is a simple parser."""
@@ -50601,6 +50673,28 @@ class KernelTaskCommand(GenericCommand):
             lwp_task_addrs.extend(seen)
         return lwp_task_addrs
 
+    def get_offset_nsproxy(self, task_addr, offset_files):
+        """
+        struct task_struct {
+            ...
+            struct files_struct *files;
+        #ifdef CONFIG_IO_URING
+            struct io_uring_task *io_uring;
+        #endif
+            struct nsproxy *nsproxy;
+            struct signal_struct *signal;
+            struct sighand_struct __rcu *sighand;
+            sigset_t blocked;
+            ...
+        };
+        """
+        offset_nsproxy = offset_files + current_arch.ptrsize
+        if not is_valid_addr(read_int_from_memory(task_addr + offset_nsproxy + current_arch.ptrsize * 3)): # blocked
+            # CONFIG_IO_URING=n
+            return offset_nsproxy
+        # CONFIG_IO_URING=y
+        return offset_nsproxy + current_arch.ptrsize
+
     def get_offset_sighand(self, task_addr, offset_files):
         """
         struct task_struct {
@@ -50925,7 +51019,7 @@ class KernelTaskCommand(GenericCommand):
             self.quiet_info("offsetof(inode, i_ino): {:#x}".format(self.offset_i_ino))
 
         # task_struct->files
-        if args.print_fd or args.print_sighand:
+        if args.print_fd or args.print_sighand or args.print_namespace:
             if self.offset_files is None:
                 self.offset_files = self.get_offset_files(task_addrs, self.offset_comm)
             if self.offset_files is None:
@@ -50941,6 +51035,24 @@ class KernelTaskCommand(GenericCommand):
                 self.quiet_err("Not found files_struct->fdt")
                 return False
             self.quiet_info("offsetof(files_struct, fdt): {:#x}".format(self.offset_fdt))
+
+        # cred->user_ns
+        # task_struct->nsproxy
+        if args.print_namespace:
+            if self.offset_user_ns is None:
+                init_cred = read_int_from_memory(task_addrs[0] + self.offset_cred)
+                self.offset_user_ns = self.get_offset_user_ns(init_cred, self.offset_uid)
+            if self.offset_user_ns is None:
+                self.quiet_err("Not found cred->user_ns")
+                return False
+            self.quiet_info("offsetof(cred, user_ns): {:#x}".format(self.offset_user_ns))
+
+            if self.offset_nsproxy is None:
+                self.offset_nsproxy = self.get_offset_nsproxy(task_addrs[0], self.offset_files)
+            if self.offset_nsproxy is None:
+                self.quiet_err("Not found task_struct->nsproxy")
+                return False
+            self.quiet_info("offsetof(task_struct, nsproxy): {:#x}".format(self.offset_nsproxy))
 
         # task_struct->sighand
         if args.print_sighand:
@@ -51020,7 +51132,7 @@ class KernelTaskCommand(GenericCommand):
         # print legend
         out = []
         if not self.quiet:
-            fmt = "{:<18s} {:3s} {:<7s} {:<16s} {:<18s} [{:s}] {:<10s} {:<18s} {:<18s}"
+            fmt = "{:<18s} {:3s} {:<7s} {:<16s} {:<18s} [{:s}] {:<18s} {:<18s}"
             if args.print_all_id:
                 ids_str = ["uid", "gid", "suid", "sgid", "euid", "egid", "fsuid", "fsgid"]
                 uids_fmt = "{:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s}"
@@ -51028,7 +51140,7 @@ class KernelTaskCommand(GenericCommand):
                 ids_str = ["uid", "gid"]
                 uids_fmt = "{:>5s} {:>5s}"
             uids_str = uids_fmt.format(*ids_str)
-            legend = ["task", "K/U", "lwpid", "task->comm", "task->cred", uids_str, "securebits", "kstack", "kcanary"]
+            legend = ["task", "K/U", "lwpid", "task->comm", "task->cred", uids_str, "kstack", "kcanary"]
             out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
 
         if args.quiet:
@@ -51038,6 +51150,18 @@ class KernelTaskCommand(GenericCommand):
                 from tqdm import tqdm
             except ImportError:
                 tqdm = lambda x, leave: x
+
+        if args.print_namespace:
+            kversion = KernelVersionCommand.kernel_version()
+            nsproxy_members = ["count", "uts_ns", "ipc_ns", "mnt_ns", "pid_ns_for_children", "net_ns"]
+            if kversion >= "5.6":
+                nsproxy_members += ["time_ns", "time_ns_for_children"]
+            if kversion >= "4.6":
+                nsproxy_members += ["cgroup_ns"]
+            if task_addrs:
+                init_cred = read_int_from_memory(task_addrs[0] + self.offset_cred)
+                init_user_ns = read_int_from_memory(init_cred + self.offset_user_ns)
+                init_nsproxy = read_int_from_memory(task_addrs[0] + self.offset_nsproxy)
 
         # task parse
         for task in tqdm(task_addrs, leave=False):
@@ -51049,7 +51173,6 @@ class KernelTaskCommand(GenericCommand):
             kstack = read_int_from_memory(task + self.offset_stack)
             pid = u32(read_memory(task + self.offset_pid, 4))
             cred = read_int_from_memory(task + self.offset_cred)
-            securebits = u32(read_memory(cred + self.offset_uid + 32, 4))
 
             # get process type (kernel or user-land)
             mm = read_int_from_memory(task + self.offset_mm)
@@ -51085,14 +51208,14 @@ class KernelTaskCommand(GenericCommand):
                 kcanary = "None"
 
             # make output
-            fmt = "{:#018x} {:<3s} {:<7d} {:<16s} {:#018x} [{:s}] {:#10x} {:#018x} {:<18s}"
-            out.append(fmt.format(task, proctype, pid, comm_string, cred, uids_str, securebits, kstack, kcanary))
+            fmt = "{:#018x} {:<3s} {:<7d} {:<16s} {:#018x} [{:s}] {:#018x} {:<18s}"
+            out.append(fmt.format(task, proctype, pid, comm_string, cred, uids_str, kstack, kcanary))
 
             # skip additional information when swapper/N
             if pid == 0:
                 continue
 
-            # additional information 1
+            # additional information (maps)
             if args.print_maps:
                 mms = self.get_mm(task, self.offset_mm)
                 if mms:
@@ -51102,7 +51225,7 @@ class KernelTaskCommand(GenericCommand):
                     if not args.print_regs:
                         out.append(titlify(""))
 
-            # additional information 2
+            # additional information (regs)
             if args.print_regs:
                 regs = self.get_regs(kstack, self.offset_ptregs)
                 syscall_table = get_syscall_table().table
@@ -51118,7 +51241,7 @@ class KernelTaskCommand(GenericCommand):
                     if not args.print_fd:
                         out.append(titlify(""))
 
-            # additional information 3
+            # additional information (files)
             if proctype == "U" and args.print_fd:
                 out.append(titlify("file descriptors of `{:s}`".format(comm_string)))
                 fmt = "{:3s} {:18s} {:18s} {:18s} {:s}"
@@ -51141,7 +51264,7 @@ class KernelTaskCommand(GenericCommand):
                     if not args.print_sighand:
                         out.append(titlify(""))
 
-            # additional information 4
+            # additional information (sighands)
             if proctype == "U" and args.print_sighand:
                 out.append(titlify("sighandlers of `{:s}`".format(comm_string)))
                 fmt = "{:14s} {:18s} {:18s} {:18s}"
@@ -51163,6 +51286,32 @@ class KernelTaskCommand(GenericCommand):
                         handler = "{:#018x}".format(handler)
                     flags = read_int_from_memory(sigaction + current_arch.ptrsize * 1)
                     out.append("{:<2d} {:11s} {:#018x} {:18s} {:#018x}".format(i + 1, signame, sigaction, handler, flags))
+                if not args.print_namespace:
+                    out.append(titlify(""))
+
+            # additional information (namespace)
+            if proctype == "U" and args.print_namespace:
+                out.append(titlify("namespace of `{:s}`".format(comm_string)))
+                fmt = "{:30s} {:18s} {:8s}"
+                legend = ["name", "value", "init_ns?"]
+                out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
+
+                # user_ns (via real_cred)
+                real_cred = read_int_from_memory(task + self.offset_cred - current_arch.ptrsize)
+                user_ns = read_int_from_memory(real_cred + self.offset_user_ns)
+                is_init_ns = str(user_ns == init_user_ns)
+                out.append("{:30s} {:#018x} {:8s}".format("real_cred->user_ns", user_ns, is_init_ns))
+
+                # other ns (via nsproxy)
+                nsproxy = read_int_from_memory(task + self.offset_nsproxy)
+                for i, name in enumerate(nsproxy_members):
+                    value = read_int_from_memory(nsproxy + current_arch.ptrsize * i)
+                    if i == 0:
+                        is_init_ns = "-"
+                    else:
+                        init_value = read_int_from_memory(init_nsproxy + current_arch.ptrsize * i)
+                        is_init_ns = str(value == init_value)
+                    out.append("{:30s} {:#018x} {:8s}".format("nsproxy->" + name, value, is_init_ns))
                 out.append(titlify(""))
         return out
 
@@ -51268,6 +51417,32 @@ class KernelSignalsCommand(GenericCommand):
         if args.no_pager:
             no_pager = "--no-pager"
         gdb.execute("ktask --user-process-only --print-sighand --quiet {:s}".format(no_pager))
+        return
+
+
+@register_command
+class KernelNamespacesCommand(GenericCommand):
+    """Display namespaces of each process (shortcut for `ktask -quN`)."""
+    _cmdline_ = "knamespaces"
+    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
+    _syntax_ = parser.format_help()
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.dont_repeat()
+        info("Redirect to `ktask -quN`")
+
+        no_pager = ""
+        if args.no_pager:
+            no_pager = "--no-pager"
+        gdb.execute("ktask --user-process-only --print-namespace --quiet {:s}".format(no_pager))
         return
 
 
