@@ -62946,6 +62946,368 @@ class KernelBpfCommand(GenericCommand):
 
 
 @register_command
+class KernelIpsCommand(GenericCommand):
+    """Dump IPCs information (sem, msg, shm)."""
+    _cmdline_ = "kipcs"
+    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.initialized = False
+        self.offset_xa_head = None
+        self.offset_sem_nsems = None
+        self.offset_q_cbytes = None
+        self.offset_q_qnum = None
+        self.offset_shm_nattch = None
+        self.offset_shm_segsz = None
+        return
+
+    def get_all_ipc_ns(self):
+        res = gdb.execute("ktask --print-namespace --user-process-only --no-pager --quiet", to_string=True)
+        r = re.findall(r"nsproxy->ipc_ns\s+(0x\S+)", res)
+
+        ipc_ns_list = []
+        # do not use `set()` because the order is important.
+        for x in r:
+            x = int(x, 16)
+            if x not in ipc_ns_list:
+                ipc_ns_list.append(x)
+        return ipc_ns_list
+
+    def initialize(self, ipc_ns_list):
+        if self.initialized:
+            return True
+
+        if ipc_ns_list == []:
+            return False
+
+        # ipc_namespace
+        """
+        struct ipc_namespace {
+            refcount_t count; // ~5.10
+            struct ipc_ids {
+                int in_use;
+                unsigned short seq;
+                struct rw_semaphore {
+                    atomic_long_t count;
+                    atomic_long_t owner;
+                #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+                    struct optimistic_spin_queue osq;
+                #endif
+                    raw_spinlock_t wait_lock;
+                    struct list_head wait_list;
+                #ifdef CONFIG_DEBUG_RWSEMS
+                    void *magic;
+                #endif
+                #ifdef CONFIG_DEBUG_LOCK_ALLOC
+                    struct lockdep_map dep_map;
+                #endif
+                } rwsem;
+                struct idr {
+                    struct radix_tree_root { // =struct xarray
+                        spinlock_t xa_lock;
+                        gfp_t xa_flags;
+                        void __rcu *xa_head;
+                    } idr_rt;
+                    unsigned int idr_base;
+                    unsigned int idr_next;
+                } ipcs_idr;
+                int max_idx;
+                int last_idx;
+            #ifdef CONFIG_CHECKPOINT_RESTORE
+                int next_id;
+            #endif
+                struct rhashtable key_ht;
+            } ids[3];
+            ...
+        """
+        kversion = KernelVersionCommand.kernel_version()
+        if kversion >= "5.11":
+            self.offset_ids = 0
+        else:
+            self.offset_ids = current_arch.ptrsize
+        if not self.quiet:
+            info("offsetof(ipc_namespace, ids): {:#x}".format(self.offset_ids))
+
+        # offsetof(ipc_ids, ipcs_idr.idr_rt.xa_head): unaligned valid pointer is `xa_head`.
+        # sizeof(ids[0]): find two `xa_head` and calculate the distance.
+        init_ipc_ns = ipc_ns_list[0]
+        found = []
+        for i in range(100):
+            x = self.offset_ids + current_arch.ptrsize * i
+            y = read_int_from_memory(init_ipc_ns + x)
+            if is_valid_addr(y) and (y & 0x2 == 0x2): # search ipcs_idr.idr_rt.xa_head (it has tag)
+                if self.offset_xa_head is None:
+                    self.offset_xa_head = x - self.offset_ids
+                found.append(x - self.offset_ids)
+            if len(found) >= 2:
+                self.sizeof_ipc_ids = found[1] - found[0]
+                break
+        else:
+            if not self.quiet:
+                err("Not found ipc_namespace->ids[0].ipcs_idr.idr_rt.xa_head")
+                err("Not recognized sizeof(struct ipc_ids)")
+            return False
+        if not self.quiet:
+            info("offsetof(ipc_ids, ipcs_idr.idr_rt.xa_head): {:#x}".format(self.offset_xa_head))
+            info("sizeof(struct ipc_ids): {:#x}".format(self.sizeof_ipc_ids))
+
+        # xa_node
+        """
+        struct xa_node {
+            unsigned char shift;
+            unsigned char offset;
+            unsigned char count;
+            unsigned char nr_values;
+            struct xa_node __rcu *parent;
+            struct xarray *array;
+            union {
+                struct list_head private_list;
+                struct rcu_head rcu_head;
+            };
+            void __rcu *slots[XA_CHUNK_SIZE];
+            union {
+                unsigned long tags[XA_MAX_MARKS][XA_MARK_LONGS];
+                unsigned long marks[XA_MAX_MARKS][XA_MARK_LONGS];
+            };
+        };
+        """
+        # xa_node->{shift,count,slots}
+        self.offset_shift = 0
+        self.offset_count = 2
+        self.offset_slots = current_arch.ptrsize * 5
+
+        # kern_ipc_perm
+        """
+        struct kern_ipc_perm {
+            spinlock_t lock;
+            bool deleted;
+            int id;
+            key_t key;
+            kuid_t uid;
+            kgid_t gid;
+            kuid_t cuid;
+            kgid_t cgid;
+            umode_t mode;
+            unsigned long seq;
+            void *security;
+            struct rhash_head khtnode;
+            struct rcu_head rcu;
+            refcount_t refcount;
+        } ____cacheline_aligned_in_smp __randomize_layout;
+        """
+        self.offset_id = 4 + 4
+        self.offset_key = self.offset_id + 4
+        self.offset_uid = self.offset_key + 4
+        self.offset_gid = self.offset_uid + 4
+        self.offset_mode = self.offset_gid + 4 + 4 + 4
+
+        self.initialized = True
+        return True
+
+    def parse_xarray(self, ptr, root=False):
+        if ptr == 0:
+            return []
+
+        ptr &= ~3 # untagged
+
+        if root:
+            # ptr is &ipc_ids[i]
+            node = read_int_from_memory(ptr + self.offset_xa_head)
+            return self.parse_xarray(node)
+
+        shift = u8(read_memory(ptr + self.offset_shift, 1))
+        count = u8(read_memory(ptr + self.offset_count, 1))
+        slots = ptr + self.offset_slots
+        elems = []
+        for i in range(64): # 16 or 64
+            x = read_int_from_memory(slots + current_arch.ptrsize * i)
+            if x == 0:
+                continue
+            if shift:
+                elems += self.parse_xarray(x)
+            else:
+                elems.append(x)
+            count -= 1
+            if count == 0:
+                break
+        return elems
+
+    def dump_ipc_sem_ids(self, ipc_ids_ptr):
+        """
+        struct sem_array {
+            struct kern_ipc_perm sem_perm;
+            time64_t sem_ctime;
+            struct list_head pending_alter;
+            struct list_head pending_const;
+            struct list_head list_id;
+            int sem_nsems;
+            ...
+        } __randomize_layout;
+        """
+        self.out.append(titlify("Semaphore Arrays"))
+        fmt = "{:18s} {:5s} {:10s} {:4s} {:4s} {:5s} {:s}"
+        legend = ["sem_array", "semid", "key", "uid", "gid", "perms", "nsems"]
+        self.out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
+
+        elems = self.parse_xarray(ipc_ids_ptr, root=True)
+        for e in elems:
+            semid = u32(read_memory(e + self.offset_id, 4))
+            key = u32(read_memory(e + self.offset_key, 4))
+            uid = u32(read_memory(e + self.offset_uid, 4))
+            gid = u32(read_memory(e + self.offset_gid, 4))
+            mode = u16(read_memory(e + self.offset_mode, 2))
+
+            if self.offset_sem_nsems is None:
+                for i in range(1, 64):
+                    base = self.offset_mode + current_arch.ptrsize * i
+                    if all(is_valid_addr(read_int_from_memory(e + base + current_arch.ptrsize * j)) for j in range(6)):
+                        self.offset_sem_nsems = base + current_arch.ptrsize * 6
+                        break
+            if self.offset_sem_nsems:
+                nsems = read_int_from_memory(e + self.offset_sem_nsems)
+                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:d}".format(e, semid, key, uid, gid, mode, nsems))
+            else:
+                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:s}".format(e, semid, key, uid, gid, mode, "?"))
+
+        return
+
+    def dump_ipc_msg_ids(self, ipc_ids_ptr):
+        """
+        struct msg_queue {
+            struct kern_ipc_perm q_perm;
+            time64_t q_stime;
+            time64_t q_rtime;
+            time64_t q_ctime;
+            unsigned long q_cbytes;
+            unsigned long q_qnum;
+            unsigned long q_qbytes;
+            struct pid *q_lspid;
+            struct pid *q_lrpid;
+            struct list_head q_messages;
+            struct list_head q_receivers;
+            struct list_head q_senders;
+        } __randomize_layout;
+        """
+        self.out.append(titlify("Message Queues"))
+        fmt = "{:18s} {:5s} {:10s} {:4s} {:4s} {:5s} {:10s} {:8s}"
+        legend = ["msg_queue", "msqid", "key", "uid", "gid", "perms", "used-bytes", "messages"]
+        self.out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
+
+        elems = self.parse_xarray(ipc_ids_ptr, root=True)
+        for e in elems:
+            msqid = u32(read_memory(e + self.offset_id, 4))
+            key = u32(read_memory(e + self.offset_key, 4))
+            uid = u32(read_memory(e + self.offset_uid, 4))
+            gid = u32(read_memory(e + self.offset_gid, 4))
+            mode = u16(read_memory(e + self.offset_mode, 2))
+
+            if self.offset_q_cbytes is None:
+                for i in range(1, 64):
+                    base = self.offset_mode + current_arch.ptrsize * i
+                    if all(is_valid_addr(read_int_from_memory(e + base + current_arch.ptrsize * j)) for j in range(6)):
+                        if not is_valid_addr(read_int_from_memory(e + base + current_arch.ptrsize * 6)):
+                            self.offset_q_cbytes = base - current_arch.ptrsize * 5
+                            self.offset_q_qnum = base - current_arch.ptrsize * 4
+                            break
+            if self.offset_q_cbytes:
+                q_cbytes = read_int_from_memory(e + self.offset_q_cbytes)
+                q_qnum = read_int_from_memory(e + self.offset_q_qnum)
+                fmt = "{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:<#10x} {:<8d}"
+                self.out.append(fmt.format(e, msqid, key, uid, gid, mode, q_cbytes, q_qnum))
+            else:
+                fmt = "{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:10s} {:8s}"
+                self.out.append(fmt.format(e, msqid, key, uid, gid, mode, "?", "?"))
+        return
+
+    def dump_ipc_shm_ids(self, ipc_ids_ptr):
+        """
+        struct shmid_kernel {
+            struct kern_ipc_perm shm_perm;
+            struct file *shm_file;
+            unsigned long shm_nattch;
+            unsigned long shm_segsz;
+            ...
+        } __randomize_layout;
+        """
+        self.out.append(titlify("Shared Memory Segments"))
+        fmt = "{:18s} {:5s} {:10s} {:4s} {:4s} {:5s} {:10s} {:6s}"
+        legend = ["shmid_kernel", "shmid", "key", "uid", "gid", "perms", "bytes", "nattch"]
+        self.out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
+
+        elems = self.parse_xarray(ipc_ids_ptr, root=True)
+        for e in elems:
+            shmid = u32(read_memory(e + self.offset_id, 4))
+            key = u32(read_memory(e + self.offset_key, 4))
+            uid = u32(read_memory(e + self.offset_uid, 4))
+            gid = u32(read_memory(e + self.offset_gid, 4))
+            mode = u16(read_memory(e + self.offset_mode, 2))
+
+            if self.offset_shm_nattch is None:
+                for i in range(1, 64):
+                    base = self.offset_mode + current_arch.ptrsize * i
+                    x = read_int_from_memory(e + base)
+                    y = read_int_from_memory(e + base + current_arch.ptrsize * 2)
+                    if is_valid_addr(x) and y != 0 and y % 0x1000 == 0:
+                        self.offset_shm_nattch = base + current_arch.ptrsize
+                        self.offset_shm_segsz = base + current_arch.ptrsize * 2
+                        break
+            if self.offset_shm_nattch:
+                nattch = read_int_from_memory(e + self.offset_shm_nattch)
+                segsz = read_int_from_memory(e + self.offset_shm_segsz)
+                fmt = "{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:<#10x} {:<6d}"
+                self.out.append(fmt.format(e, shmid, key, uid, gid, mode, segsz, nattch))
+            else:
+                fmt = "{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:10s} {:6s}"
+                self.out.append(fmt.format(e, shmid, key, uid, gid, mode, "?", "?"))
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.dont_repeat()
+
+        self.quiet = args.quiet
+        if not self.quiet:
+            info("Wait for memory scan")
+
+        kversion = KernelVersionCommand.kernel_version()
+        if kversion < "4.20":
+            # xarray is introduced from 4.20
+            if not self.quiet:
+                err("Unsupported v4.19 or before")
+            return
+
+        ipc_ns_list = self.get_all_ipc_ns()
+        if self.initialize(ipc_ns_list) is False:
+            if not self.quiet:
+                err("Failed to initialize")
+            return
+
+        self.out = []
+        for i, ipc_ns in enumerate(ipc_ns_list):
+            if i == 0:
+                self.out.append(titlify("init_ipc_ns: {:#x}".format(ipc_ns), color="bold", msg_color="bold"))
+            else:
+                self.out.append(titlify("ipc_ns: {:#x}".format(ipc_ns), color="bold", msg_color="bold"))
+            self.dump_ipc_sem_ids(ipc_ns + self.offset_ids + self.sizeof_ipc_ids * 0)
+            self.dump_ipc_msg_ids(ipc_ns + self.offset_ids + self.sizeof_ipc_ids * 1)
+            self.dump_ipc_shm_ids(ipc_ns + self.offset_ids + self.sizeof_ipc_ids * 2)
+
+        # print
+        gef_print("\n".join(self.out), less=not args.no_pager)
+        return
+
+
+@register_command
 class VmallocDumpCommand(GenericCommand):
     """Dump vmalloc used list and freed list."""
     _cmdline_ = "vmalloc-dump"
