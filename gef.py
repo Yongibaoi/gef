@@ -62484,38 +62484,37 @@ class KernelBpfCommand(GenericCommand):
     _note_ += "\n"
     _note_ += "Simplified bpf structure:\n"
     _note_ += "\n"
-    _note_ += "+-prog_idr--+   +--->+-xa_node----------+   +-------->+-bpf_prog-------------+\n"
-    _note_ += "| xa_head   |   |    | shift            |   |         | ...                  |\n"
-    _note_ += "| xa_flags  |   |    | ...              |   |         | type                 |\n"
-    _note_ += "| xa_head   |---+    | count            |   |         | expected_attach_type |\n"
-    _note_ += "+-----------+        | ...              |   |         | len                  |\n"
-    _note_ += "                     | slots[0]         |---+         | jited_len            |\n"
-    _note_ += "                     | slots[1]         |--->xa_node  | tag[8]               |\n"
-    _note_ += "                     | ...              |    or       | ...                  |\n"
-    _note_ += "                     | slots[15 or 63]  |--->bpf_prog | bpf_func             |---> BPF-code\n"
-    _note_ += "                     | ...              |             | ...                  |\n"
-    _note_ += "                     +------------------+             | aux                  |\n"
-    _note_ += "                                                      | ...                  |\n"
-    _note_ += "                                                      +----------------------+\n"
+    _note_ += "+-prog_idr--+   +--->+-xa_node----------+   +--------->+-bpf_prog-------------+\n"
+    _note_ += "| xa_head   |   |    | shift            |   |          | ...                  |\n"
+    _note_ += "| xa_flags  |   |    | ...              |   |          | type                 |\n"
+    _note_ += "| xa_head   |---+    | count            |   |          | expected_attach_type |\n"
+    _note_ += "+-----------+        | ...              |   |          | len                  |\n"
+    _note_ += "                     | slots[0]         |---+          | jited_len            |\n"
+    _note_ += "                     | slots[1]         |--->xa_node   | tag[8]               |\n"
+    _note_ += "                     | ...              |    or        | ...                  |\n"
+    _note_ += "                     | slots[15 or 63]  |    bpf_prog  | bpf_func             |---> BPF-code\n"
+    _note_ += "                     | ...              |              | ...                  |\n"
+    _note_ += "                     +------------------+              | aux                  |\n"
+    _note_ += "                                                       | ...                  |\n"
+    _note_ += "                                                       +----------------------+\n"
     _note_ += "\n"
-    _note_ += "+-map_idr---+   +--->+-xa_node----------+   +-------->+-bpf_map--------------+\n"
-    _note_ += "| xa_head   |   |    | shift            |   |         | map                  |\n"
-    _note_ += "| xa_flags  |   |    | ...              |   |         |   ...                |\n"
-    _note_ += "| xa_head   |---+    | count            |   |         |   map_type           |\n"
-    _note_ += "+-----------+        | ...              |   |         |   key_size           |\n"
-    _note_ += "                     | slots[0]         |---+         |   value_size         |\n"
-    _note_ += "                     | slots[1]         |--->xa_node  |   max_entries        |\n"
-    _note_ += "                     | ...              |    or       |   ...                |\n"
-    _note_ += "                     | slots[15 or 63]  |--->bpf_prog | elem_size            |\n"
-    _note_ += "                     | ...              |             | index_mask           |\n"
-    _note_ += "                     +------------------+             | ...                  |\n"
-    _note_ += "                                                      +----------------------+\n"
-    _note_ += "                                                      | value[0]             |\n"
-    _note_ += "                                                      | value[1]             |\n"
-    _note_ += "                                                      | ...                  |\n"
-    _note_ += "                                                      | value[max_entries-1] |\n"
-    _note_ += "                                                      +----------------------+\n"
-
+    _note_ += "+-map_idr---+   +--->+-xa_node----------+   +--------->+-bpf_array------------+\n"
+    _note_ += "| xa_head   |   |    | shift            |   |          | map                  |\n"
+    _note_ += "| xa_flags  |   |    | ...              |   |          |   ...                |\n"
+    _note_ += "| xa_head   |---+    | count            |   |          |   map_type           |\n"
+    _note_ += "+-----------+        | ...              |   |          |   key_size           |\n"
+    _note_ += "                     | slots[0]         |---+          |   value_size         |\n"
+    _note_ += "                     | slots[1]         |--->xa_node   |   max_entries        |\n"
+    _note_ += "                     | ...              |    or        |   ...                |\n"
+    _note_ += "                     | slots[15 or 63]  |    bpf_array | elem_size            |\n"
+    _note_ += "                     | ...              |              | index_mask           |\n"
+    _note_ += "                     +------------------+              | ...                  |\n"
+    _note_ += "                                                       +----------------------+\n"
+    _note_ += "                                                       | value[0]             |\n"
+    _note_ += "                                                       | value[1]             |\n"
+    _note_ += "                                                       | ...                  |\n"
+    _note_ += "                                                       | value[max_entries-1] |\n"
+    _note_ += "                                                       +----------------------+\n"
 
     def parse_xarray(self, ptr, root=False):
         if ptr == 0:
@@ -62623,7 +62622,8 @@ class KernelBpfCommand(GenericCommand):
             if not self.quiet:
                 info("Num of maps: {:#x}".format(len(maps)))
         except gdb.MemoryError:
-            err("Not found")
+            if not self.quiet:
+                err("Not found")
             return False
 
         """
@@ -62722,6 +62722,7 @@ class KernelBpfCommand(GenericCommand):
             """
             # bpf_array->union_array
             value_size = u32(read_memory(maps[0] + self.offset_value_size, 4))
+            value_size_aligned_8 = align_address_to_size(value_size, 8)
             max_entries = u32(read_memory(maps[0] + self.offset_max_entries, 4))
             k = 1
             while k < max_entries:
@@ -62734,7 +62735,7 @@ class KernelBpfCommand(GenericCommand):
                 pos = base + current_arch.ptrsize * i
                 x = u32(read_memory(pos, 4))
                 y = u32(read_memory(pos + 4, 4))
-                if x == value_size and y == index_mask:
+                if x == value_size_aligned_8 and y == index_mask:
                     self.offset_union_array = (pos - maps[0]) + 4 * 2 + current_arch.ptrsize
                     if not self.quiet:
                         info("offsetof(bpf_array, union_array): {:#x}".format(self.offset_union_array))
@@ -62903,27 +62904,32 @@ class KernelBpfCommand(GenericCommand):
         self.dont_repeat()
 
         self.quiet = args.quiet
-        if not args.quiet:
+        if not self.quiet:
             info("Wait for memory scan")
         self.verbose = args.verbose
 
         kversion = KernelVersionCommand.kernel_version()
         if kversion < "4.20":
             # xarray is introduced from 4.20
-            err("Unsupported v4.19 or before")
+            if not self.quiet:
+                err("Unsupported v4.19 or before")
             return
 
         stv_bpf_ret = gdb.execute("syscall-table-view -f bpf --quiet --no-pager", to_string=True)
         if "bpf" not in stv_bpf_ret:
-            err("bpf syscall is unimplemented")
+            if not self.quiet:
+                err("bpf syscall is unimplemented")
             return
         elif "invalid bpf" in stv_bpf_ret:
-            err("bpf syscall is disabled")
+            if not self.quiet:
+                err("bpf syscall is disabled")
             return
 
         # init
         ret = self.initialize()
         if ret is False:
+            if not self.quiet:
+                err("Failed to initialize")
             return
         progs, maps = ret
 
