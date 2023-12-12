@@ -25205,8 +25205,8 @@ class HexdumpFlexibleCommand(GenericCommand):
     parser.add_argument("--phys", action="store_true", help="treat the address as physical memory (only qemu-system).")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
 
-    _example_ = "{:s} \"2Q2I2H2B\" $rsp 4  # \"Show qword*2, dword*2, short*2, byte*2\" is repeated 4 times\n".format(_cmdline_)
-    _example_ += "{:s} \"4Q-2Q\" $rsp 4     # \"Show qword*4 and skip qword*2\" is repeated 4 times".format(_cmdline_)
+    _example_ = "{:s} \"2Q2I2H2B\" $rsp 4  # \"Show qword*2, dword*2, short*2, byte*2\" from $rsp and repeat 4 times\n".format(_cmdline_)
+    _example_ += "{:s} \"4Q-2Q\" $rsp 4     # \"Show qword*4 and skip qword*2\" from $rsp and repeat 4 times".format(_cmdline_)
 
     def extract_each_type(self, fmt):
         out = []
