@@ -52144,13 +52144,13 @@ class KernelBlockDevicesCommand(GenericCommand):
 
         def iterate_pattern(kind_sep, kind_max, dev_str, sym_start):
             def gen():
-              cs = "abcdefghijklmnopqrstuvwxyz"
-              for c in cs:
-                yield c
-              for c1 in cs:
-                for c2 in cs:
-                  yield c1 + c2
-              return
+                cs = "abcdefghijklmnopqrstuvwxyz"
+                for c in cs:
+                    yield c
+                for c1 in cs:
+                    for c2 in cs:
+                        yield c1 + c2
+                return
             name_list = list(gen())
             kind = minor // kind_sep
             num = minor % kind_sep
@@ -52158,7 +52158,7 @@ class KernelBlockDevicesCommand(GenericCommand):
                 offset = name_list.index(sym_start)
                 dev = "/dev/{:s}{:s}".format(dev_str, name_list[offset + kind])
                 if num:
-                   dev = "{:s}{:d}".format(dev, num)
+                    dev = "{:s}{:d}".format(dev, num)
                 return dev
             return "???"
 
@@ -56489,7 +56489,7 @@ class ExecAsm:
 
     def revert_stdout(self):
         if self.debug:
-           return
+            return
         gef_on_stop_hook(hook_stop_handler)
         os.dup2(self.stdout_bak, self.stdout)
         os.close(self.stdout_bak)
@@ -63755,8 +63755,8 @@ class KsymaddrRemoteCommand(GenericCommand):
 
         while True:
             if position < 0:
-               self.quiet_err("Could not find kallsyms_names")
-               return False
+                self.quiet_err("Could not find kallsyms_names")
+                return False
 
             # Do some types of checks.
             # 1: check the token type is likely or not.
@@ -67487,8 +67487,10 @@ class OpteeBgetDumpCommand(GenericCommand):
             if flink % 8 or blink % 8 or bsize % 8 or next_prevfree % 8 or next_bsize % 8:
                 flinks.append("unaligned corrupted")
                 break
-            _chunk = {"addr": current, "prevfree": prevfree, "bsize": bsize, "flink": flink, "blink": blink,
-                      "next_prevfree": next_prevfree, "next_bsize": next_bsize}
+            _chunk = {
+                "addr": current, "prevfree": prevfree, "bsize": bsize, "flink": flink, "blink": blink,
+                "next_prevfree": next_prevfree, "next_bsize": next_bsize,
+            }
             Chunk = collections.namedtuple("Chunk", _chunk.keys())
             flinks.append(Chunk(*_chunk.values()))
             if flink == head:
@@ -67518,8 +67520,10 @@ class OpteeBgetDumpCommand(GenericCommand):
             if flink % 8 or blink % 8 or bsize % 8 or next_prevfree % 8 or next_bsize % 8:
                 blinks.append("unaligned corrupted")
                 break
-            _chunk = {"addr": current, "prevfree": prevfree, "bsize": bsize, "flink": flink, "blink": blink,
-                      "next_prevfree": next_prevfree, "next_bsize": next_bsize}
+            _chunk = {
+                "addr": current, "prevfree": prevfree, "bsize": bsize, "flink": flink, "blink": blink,
+                "next_prevfree": next_prevfree, "next_bsize": next_bsize,
+            }
             Chunk = collections.namedtuple("Chunk", _chunk.keys())
             blinks.append(Chunk(*_chunk.values()))
             if blink == head:
@@ -71691,7 +71695,7 @@ class PagewalkArm64Command(PagewalkCommand):
     """
     Relation diagram when CPU uses
 
-     Stage1                   |     Stage2
+      Stage1                  |     Stage2
     -------------------------------------------------------
     +----------------------+  |   +----------------------+
     | Guest OS table       | -|-> | Virtualization table |
